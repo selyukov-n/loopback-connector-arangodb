@@ -3,6 +3,7 @@
 # Module dependencies
 arangojs = require 'arangojs'
 qb = require 'aqb'
+qbTypes = require 'aqb/types'
 url = require 'url'
 merge = require 'extend'
 async = require 'async'
@@ -164,6 +165,22 @@ class ArangoDBConnector extends Connector
       if !_id then continue
       return key
     return false
+
+  ###
+    Finds calculated field names in a model
+    @param model [String] The model name to lookup
+    @return [Array|Boolean] Returns Array of field names or false if model has no calculated fields
+  ###
+
+  _calculatedProps: (model) ->
+      props = @getModelClass(model).properties
+  
+      for key, prop of props          
+        if !prop.arangodb || !prop.arangodb.aqlFormula then continue
+        if !calculatedProps then calculatedProps = {}
+        calculatedProps[key] = prop.arangodb.aqlFormula;
+  
+      return calculatedProps || false;
 
   ###
     Get if the model has _from field
@@ -460,6 +477,8 @@ class ArangoDBConnector extends Connector
 
     #  array holding the filter
     aqlArray = []
+    #  array holding calculated properties
+    usedCalcProps = []
     #  the object holding the assignments of conditional values to temporary variables
     bindVars = {}
     geoExpr = {}
@@ -475,6 +494,7 @@ class ArangoDBConnector extends Connector
     fullIdName = @_fullIdName model
     fromName = @_fromName model
     toName = @_toName model
+    calculatedProps = @_calculatedProps model
     ###
       the where object comes in two flavors
 
@@ -504,6 +524,7 @@ class ArangoDBConnector extends Connector
               cond = @_buildWhere model, a, ++index
               aql = aql[condProp] cond.aqlArray[0]
               bindVars = merge true, bindVars, cond.bindVars
+              usedCalcProps = merge true, usedCalcProps, cond.usedCalcProps
             aqlArray.push aql
             aql = null
           return
@@ -514,29 +535,37 @@ class ArangoDBConnector extends Connector
           options = condValue.options
           condOp = Object.keys(condValue)[0]
           condValue = condValue[condOp]
+
+        if calculatedProps and calculatedProps[condProp]
+          compareToPropValue = condProp            
+          if usedCalcProps.indexOf(condProp) == -1
+            usedCalcProps.push(condProp);
+        else
+          compareToPropValue = @returnVariable + "." + condProp;
+
         if condOp
           # If the value is not an array, fall back to regular fields
           switch
             # number comparison
             when condOp in ['lte', 'lt', 'gte', 'gt', 'eq', 'neq']
-              aqlArray.push qb[condOp] "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}"
+              aqlArray.push qb[condOp] compareToPropValue, "#{assignNewQueryVariable(condValue)}"
             # range comparison
             when condOp is 'between'
-              aqlArray.push [qb.gte("#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue[0])}"),  qb.lte("#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue[1])}")]
+              aqlArray.push [qb.gte(compareToPropValue, "#{assignNewQueryVariable(condValue[0])}"),  qb.lte(compareToPropValue, "#{assignNewQueryVariable(condValue[1])}")]
             # string comparison
             when condOp is 'like'
               if options is 'i' then options = true else options = false
-              aqlArray.push qb.fn('LIKE') "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}", options
+              aqlArray.push qb.fn('LIKE') compareToPropValue, "#{assignNewQueryVariable(condValue)}", options
             when condOp is 'nlike'
               if options is 'i' then options = true else options = false
-              aqlArray.push qb.not qb.fn('LIKE') "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}", options
+              aqlArray.push qb.not qb.fn('LIKE') compareToPropValue, "#{assignNewQueryVariable(condValue)}", options
             # array comparison
             when condOp is 'nin'
-              aqlArray.push qb.not qb.in "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}"
+              aqlArray.push qb.not qb.in compareToPropValue, "#{assignNewQueryVariable(condValue)}"
             when condOp is 'inq'
               #TODO fix for id and other type
               condValue = (cond.toString() for cond in condValue)
-              aqlArray.push qb.in "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}"
+              aqlArray.push qb.in compareToPropValue, "#{assignNewQueryVariable(condValue)}"
             # geo comparison (extra object)
             when condOp is 'near'
               # 'near' does not create a condition in the filter part, it returnes the lat/long pair
@@ -551,11 +580,12 @@ class ArangoDBConnector extends Connector
             else
               console.warn 'No matching operator for : ', condOp
         else
-          aqlArray.push qb.eq "#{@returnVariable}.#{condProp}", "#{assignNewQueryVariable(condValue)}"
+          aqlArray.push qb.eq compareToPropValue, "#{assignNewQueryVariable(condValue)}"
     return {
     aqlArray: aqlArray
     bindVars: bindVars
     geoExpr: geoExpr
+    usedCalcProps: usedCalcProps
     }
 
   ###
@@ -572,10 +602,25 @@ class ArangoDBConnector extends Connector
     fullIdName = @_fullIdName model
     fromName = @_fromName model
     toName = @_toName model
+    calcProps = @_calculatedProps model
+    usedCalcProps = {}
 
     bindVars =
       '@collection': @getCollectionName model
     aql = qb.for(@returnVariable).in('@@collection')
+
+    addCalcPropertyToAql = (prop) =>
+      if usedCalcProps[prop] # we do not need to add properties which already added
+        return;
+
+      aqlFormula = calcProps[prop]
+      aqlFormula = aqlFormula.replace("${returnVariable}", @returnVariable)
+      aql = aql["let"] prop, new qbTypes.RawExpression aqlFormula
+
+      if !usedCalcProps
+        usedCalcProps = {};            
+      
+      usedCalcProps[prop] = prop;
 
     if filter.where
       if filter.where[idName]
@@ -597,6 +642,10 @@ class ArangoDBConnector extends Connector
         filter.where._from = to;
 
       where = @_buildWhere(model, filter.where)
+
+      for calcProp in where.usedCalcProps
+        addCalcPropertyToAql calcProp;
+
       for w in where.aqlArray
         aql = aql.filter(w)
       merge true, bindVars, where.bindVars
@@ -612,10 +661,17 @@ class ArangoDBConnector extends Connector
             when fullIdName then field = '_id'
             when fromName then field = '_from'
             when toName then field = '_to'
-        if m and m[1] is 'DE'
-          aql = aql.sort(@returnVariable + '.' + field, 'DESC')
+
+        sortOrder = 'ASC'
+        
+        if m and m[1] == 'DE'
+            sortOrder = 'DESC';
+
+        if calcProps[field]
+          addCalcPropertyToAql field
+          aql = aql.sort field, sortOrder
         else
-          aql = aql.sort(@returnVariable + '.' + field, 'ASC')
+          aql = aql.sort @returnVariable + '.' + field, sortOrder
     else if !@settings.disableDefaultSortByKey
       aql = aql.sort(@returnVariable + '._key')
 
@@ -636,10 +692,16 @@ class ArangoDBConnector extends Connector
       indexToName = fields.indexOf(toName)
       if indexToName isnt -1
         fields[indexToName] = '_to'
+
+      for field in fields    
+        if calcProps[field]
+          addCalcPropertyToAql field
+
       fields = ( '"' + field + '"' for field in fields)
-      aql = aql.return(qb.fn('KEEP') @returnVariable, fields)
+                
+      aql = aql.return(qb.fn('KEEP') qb.fn("MERGE")(@returnVariable, usedCalcProps), fields)
     else
-      aql = aql.return((qb.fn('UNSET') @returnVariable, ['"_rev"']))
+      aql = aql.return(qb.fn('UNSET') qb.fn("MERGE")(@returnVariable, usedCalcProps), ['"_rev"'])
 
     @execute model, 'query', aql, bindVars, (err, cursor) =>
       return callback err if err
