@@ -98,7 +98,7 @@ class ArangoDBConnector extends Connector
     debug "ArangoDB connection is called with settings: #{JSON.stringify @settings}" if @debug
     if not @db
       @db = arangojs @settings
-      @api = @db.route '_api'
+      @api = @db.route '/_api'
     process.nextTick () ->
       callback and callback null, @db
 
@@ -365,7 +365,7 @@ class ArangoDBConnector extends Connector
     debug "updateOrCreate for Model #{model} with data: #{JSON.stringify data}" if @debug
 
     @getVersion (err, v) ->
-      version = new RegExp(/[2-9]+\.[6-9]+\.[0-9]+/).test(v.version)
+      version = new RegExp(/[2-9]+\.[0-9]+\.[0-9]+/).test(v.version)
       if err or !version
         err = new Error "Error updateOrCreate not supported for version {#v}"
         callback err
