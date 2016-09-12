@@ -365,7 +365,7 @@ class ArangoDBConnector extends Connector
     debug "updateOrCreate for Model #{model} with data: #{JSON.stringify data}" if @debug
 
     @getVersion (err, v) ->
-      version = new RegExp(/[2-9]+\.[0-9]+\.[0-9]+/).test(v.version)
+      version = new RegExp(/[3-9]+\.[0-9]+\.[0-9]+/).test(v.version)
       if err or !version
         err = new Error "Error updateOrCreate not supported for version {#v}"
         callback err
